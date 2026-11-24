@@ -25,8 +25,6 @@ Click **Stop** to end the signal. Closing the window keeps the app in the notifi
 
 With **Windows default** selected, the current output stays in use until you stop playback. Click **Stop**, then **Start** to use a new Windows default output.
 
-> **Windows 11** may block the current unsigned executable when Smart App Control is enabled.
-
 ## Build from source
 
 Run this from the repository root on Windows.
