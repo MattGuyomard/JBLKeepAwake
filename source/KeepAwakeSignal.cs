@@ -4,12 +4,13 @@ using System.Text;
 
 internal sealed class KeepAwakeSignal : IDisposable
 {
-    private const uint DefaultDevice = uint.MaxValue;
+    private const uint InvalidHandle = 5;
+    private const uint QueryInstanceId = 0x0800 + 17;
+    private const uint QueryInstanceIdSize = 0x0800 + 18;
     private const uint BeginLoop = 0x04;
     private const uint EndLoop = 0x08;
     private const int SampleRate = 48000;
     private const int Channels = 2;
-    private const int ToneHz = 80;
     private static readonly uint HeaderSize = (uint)Marshal.SizeOf(typeof(WaveHeader));
     private static readonly int FlagsOffset = Marshal.OffsetOf(typeof(WaveHeader), "Flags").ToInt32();
 
@@ -19,17 +20,20 @@ internal sealed class KeepAwakeSignal : IDisposable
     private bool prepared;
     private bool playing;
 
-    public void Start(int level)
+    public void Start(string outputId, int frequency, int level)
     {
         Stop();
 
-        // Four complete cycles give a seamless 50 ms loop. Windows repeats it
-        // without a timer, callback or audio thread in this application.
-        var samples = new short[SampleRate / 20 * Channels];
+        uint output = FindOutput(outputId);
+
+        // The smallest whole number of periods that fits an integer number
+        // of PCM frames lets Windows repeat the buffer without a seam.
+        int frames = SampleRate / GreatestCommonDivisor(SampleRate, frequency);
+        var samples = new short[frames * Channels];
         double amplitude = short.MaxValue * Math.Pow(10, level / 20.0);
         for (int i = 0; i < samples.Length / Channels; i++)
         {
-            short sample = (short)Math.Round(amplitude * Math.Sin(2 * Math.PI * ToneHz * i / SampleRate));
+            short sample = (short)Math.Round(amplitude * Math.Sin(2 * Math.PI * frequency * i / SampleRate));
             samples[2 * i] = sample;
             samples[2 * i + 1] = sample;
         }
@@ -47,8 +51,8 @@ internal sealed class KeepAwakeSignal : IDisposable
         try
         {
             IntPtr openedDevice;
-            Check(waveOutOpen(out openedDevice, DefaultDevice, ref format, IntPtr.Zero, IntPtr.Zero, 0),
-                "Could not open the default audio output");
+            Check(waveOutOpen(out openedDevice, output, ref format, IntPtr.Zero, IntPtr.Zero, 0),
+                "Could not open the audio output");
             device = openedDevice;
 
             int length = samples.Length * sizeof(short);
@@ -92,26 +96,24 @@ internal sealed class KeepAwakeSignal : IDisposable
     {
         if (device != IntPtr.Zero)
         {
-            if (playing)
+            uint result = playing ? waveOutReset(device) : 0;
+            if (result == 0)
             {
-                uint result = waveOutReset(device);
-                if (result != 0)
-                    return result;
                 playing = false;
+                if (prepared)
+                    result = waveOutUnprepareHeader(device, header, HeaderSize);
             }
-
-            if (prepared)
+            if (result == 0)
             {
-                uint result = waveOutUnprepareHeader(device, header, HeaderSize);
-                if (result != 0)
-                    return result;
                 prepared = false;
+                result = waveOutClose(device);
             }
+            if (result != 0 && result != InvalidHandle)
+                return result;
 
-            uint closeResult = waveOutClose(device);
-            if (closeResult != 0)
-                return closeResult;
             device = IntPtr.Zero;
+            playing = false;
+            prepared = false;
         }
 
         // Keep the allocations until the driver has returned ownership.
@@ -120,6 +122,47 @@ internal sealed class KeepAwakeSignal : IDisposable
         header = IntPtr.Zero;
         buffer = IntPtr.Zero;
         return 0;
+    }
+
+    private static int GreatestCommonDivisor(int left, int right)
+    {
+        while (right != 0)
+        {
+            int remainder = left % right;
+            left = right;
+            right = remainder;
+        }
+        return left;
+    }
+
+    private static uint FindOutput(string id)
+    {
+        // Resolve the endpoint each time because waveOut numbers can change
+        // when a speaker disconnects or reconnects.
+        int bytes = (id.Length + 1) * sizeof(char);
+        IntPtr buffer = Marshal.AllocHGlobal(bytes);
+        try
+        {
+            uint count = waveOutGetNumDevs();
+            for (uint output = 0; output < count; output++)
+            {
+                var handle = new IntPtr(output);
+                UIntPtr size;
+                if (waveOutMessage(handle, QueryInstanceIdSize, out size, UIntPtr.Zero) != 0
+                    || size.ToUInt64() != (ulong)bytes)
+                    continue;
+
+                if (waveOutMessage(handle, QueryInstanceId, buffer, size) == 0
+                    && string.Equals(id, Marshal.PtrToStringUni(buffer, id.Length), StringComparison.OrdinalIgnoreCase))
+                    return output;
+            }
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(buffer);
+        }
+
+        throw new InvalidOperationException("The audio output is not available.");
     }
 
     private static void Check(uint result, string action)
@@ -152,6 +195,15 @@ internal sealed class KeepAwakeSignal : IDisposable
         public IntPtr Next;
         public UIntPtr Reserved;
     }
+
+    [DllImport("winmm.dll")]
+    private static extern uint waveOutGetNumDevs();
+
+    [DllImport("winmm.dll")]
+    private static extern uint waveOutMessage(IntPtr device, uint message, out UIntPtr parameter, UIntPtr length);
+
+    [DllImport("winmm.dll")]
+    private static extern uint waveOutMessage(IntPtr device, uint message, IntPtr parameter, UIntPtr length);
 
     [DllImport("winmm.dll")]
     private static extern uint waveOutOpen(out IntPtr device, uint deviceId, ref WaveFormat format,
